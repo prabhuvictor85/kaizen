@@ -93,6 +93,26 @@ def _winsorize_per_date(panel: pd.DataFrame, feature_cols: List[str], lo: float 
     return panel
 
 
+# Low-cardinality string columns (sector: ~11 values; zone_type_*: SDZ/SSZ/DZ/SZ/"")
+# stored as plain object dtype cost ~80 bytes/cell (Python string object + pointer)
+# on a multi-million-row panel — at 8.1M rows that's ~3.9GB across these 6 columns
+# alone. category dtype stores one small integer code per cell into a shared,
+# deduplicated category array, cutting that to well under 100MB. Every downstream
+# consumer either casts to str before comparing (this file's own zone-score
+# blocks: `grp[tf_col].astype(str)...`) or just reads the value for CSV/JSON
+# output (portfolio construction, evaluate_forward_performance) — both behave
+# identically on category vs object dtype, so this is a pure memory win.
+_CATEGORICAL_COLS = ["sector", "zone_type_1d", "zone_type_1wk", "zone_type_1mo",
+                     "zone_type_3mo", "zone_type_1y"]
+
+
+def _cast_categorical(panel: pd.DataFrame) -> pd.DataFrame:
+    for col in _CATEGORICAL_COLS:
+        if col in panel.columns and str(panel[col].dtype) != "category":
+            panel[col] = panel[col].astype("category")
+    return panel
+
+
 class FeatureEngineer:
     """
     Computes all features from §5.2.  All per-ticker computations use groupby.
@@ -604,6 +624,7 @@ class FeatureEngineer:
         panel = _winsorize_per_date(panel, feat_cols)
 
         log.info(f"Features computed: {len(feat_cols)} feature columns")
+        panel = _cast_categorical(panel)
         return panel
 
     def _add_sector_rs(self, panel: pd.DataFrame) -> pd.DataFrame:
@@ -909,6 +930,7 @@ class FeatureEngineer:
             - result[f"{FEATURE_PREFIX}ict_bear_htf_score"]
         ).astype(np.float32)
 
+        result = _cast_categorical(result)
         return result
 
     def recompute_zones(
