@@ -10,6 +10,7 @@ RULE: Winsorize every feature at [1, 99] percentile per date.
 """
 from __future__ import annotations
 
+import os
 import warnings
 from typing import List
 
@@ -53,11 +54,11 @@ def feature_build_workers() -> int:
         return 1
 
 
-def _parallel_batch_worker(cfg, benchmark_close, skip_ict, sub_panel):
+def _parallel_batch_worker(cfg, benchmark_close, sub_panel):
     """Runs in a worker process: per-ticker features for one batch of tickers.
     Module-level so it pickles under both fork (Linux) and spawn (Windows).
     A fresh engine per process; numba JIT warms once per worker (~5s)."""
-    fe = FeatureEngineer(cfg, benchmark_close, skip_ict=skip_ict)
+    fe = FeatureEngineer(cfg, benchmark_close)
     return fe.build(sub_panel, _per_ticker_only=True)
 
 # Columns carried from each HTF ICT run back to the daily index
@@ -128,7 +129,7 @@ class FeatureEngineer:
         frames: "list[pd.DataFrame]" = []
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
             futs = [ex.submit(_parallel_batch_worker, self.cfg,
-                              self.benchmark_close, self.skip_ict,
+                              self.benchmark_close,
                               panel[tick_level.isin(set(b))])
                     for b in batches]
             for _done, fut in enumerate(as_completed(futs), start=1):
