@@ -30,6 +30,18 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+# Point yfinance tz-cache to a real temp dir. The default cache location (or
+# set_tz_cache_location(None)) causes sqlite3.OperationalError('unable to open
+# database file') / TypeError under this script's ThreadPoolExecutor concurrent
+# downloads — multiple threads hit the same cache db file at once. Same fix as
+# download_nse_data.py (4c80387), never previously applied here.
+import tempfile as _tempfile
+_YF_CACHE_DIR = _tempfile.gettempdir()
+try:
+    yf.set_tz_cache_location(_YF_CACHE_DIR)
+except Exception:
+    pass
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
