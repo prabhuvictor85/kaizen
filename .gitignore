@@ -47,6 +47,10 @@ Thumbs.db
 
 # Scratch / debug files
 *.txt
+# ...except the pinned dependency lockfile (silently caught by *.txt above,
+# so every fresh clone lacked it and fell back to an unpinned
+# requirements.txt install instead of the tested-exact versions).
+!requirements-lock.txt
 *.log
 bkp_artifacts/
 /monitoring/
