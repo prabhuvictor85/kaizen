@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -32,8 +31,9 @@ import yfinance as yf
 
 # Point yfinance tz-cache to a real temp dir. The default cache location (or
 # set_tz_cache_location(None)) causes sqlite3.OperationalError('unable to open
-# database file') / TypeError under this script's ThreadPoolExecutor concurrent
-# downloads — multiple threads hit the same cache db file at once. Same fix as
+# database file') / TypeError — observed even under this script's now-removed
+# ThreadPoolExecutor(max_workers=1) wrapper, so this is not purely a
+# concurrency issue; harmless to keep regardless. Same fix as
 # download_nse_data.py (4c80387), never previously applied here.
 import tempfile as _tempfile
 _YF_CACHE_DIR = _tempfile.gettempdir()
@@ -51,7 +51,6 @@ CONSTITUENT_CSV = PATHS.stock_lists.us_combined  # constituents_us_combined.csv
 
 BENCHMARK_TICKERS = ["^GSPC", "^NDX"]   # S&P 500 + NASDAQ 100 indices
 START_DATE        = "2010-01-01"         # history start
-MAX_WORKERS       = 1                    # sequential — avoids rate-limit errors
 RATE_LIMIT_SLEEP  = 0.5                  # 500ms between tickers (base delay)
 MAX_RETRIES       = 3                    # retries per ticker on rate-limit / transient error
 RETRY_BACKOFF     = 2.0                  # multiply sleep by this factor on each retry
@@ -240,7 +239,14 @@ def download_ticker(ticker: str, data_dir: Path, start: str,
         if path.exists() and refresh_after_days <= 0:
             existing = pd.read_csv(path, index_col=0, parse_dates=True)
             if not existing.empty:
-                last_date = existing.index.max()
+                # .max() on a partially-parsed/object-dtype index (e.g. a
+                # malformed row in the CSV) can return a plain string rather
+                # than a Timestamp; pd.Timestamp(...) here guarantees the
+                # right type instead of relying on read_csv having fully
+                # parsed every row. Bare string+Timedelta arithmetic is
+                # deprecated (Pandas4Warning) and will raise in a future
+                # pandas version.
+                last_date = pd.Timestamp(existing.index.max())
                 new_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
                 # Nothing to fetch if already at/past the requested end date
                 if end and new_start >= end:
@@ -325,31 +331,29 @@ def download_all(tickers: List[str], data_dir: Path, start: str,
     print(f"  delay={delay}s/ticker  retries={max_retries}")
     print(f"  (existing files {'will be refreshed if older than ' + str(refresh_after_days) + ' days' if refresh_after_days > 0 else 'will be skipped'})\n")
 
-    # MAX_WORKERS=1 keeps downloads sequential, which is the safest approach for
-    # Yahoo Finance's rate limiter. The delay is applied after every ticker.
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(download_ticker, t, data_dir, start, refresh_after_days, end, max_retries): t
-            for t in tickers
-        }
-        done = 0
-        for fut in as_completed(futures):
-            done += 1
-            ticker, ok, msg = fut.result()
-            if msg.startswith("skipped"):
-                skipped += 1
-            elif ok:
-                succeeded += 1
-            else:
-                failed.append(ticker)
-                if len(failed) <= 10:   # only print first 10 failures inline
-                    print(f"  FAIL [{ticker}]: {msg}")
+    # Plain sequential loop — the safest approach for Yahoo Finance's rate
+    # limiter (previously a ThreadPoolExecutor(max_workers=1), which added
+    # thread machinery for zero concurrency benefit and made it easy for a
+    # future edit to bump MAX_WORKERS without realizing that was the only
+    # thing keeping yfinance's shared cache access single-threaded).
+    done = 0
+    for t in tickers:
+        done += 1
+        ticker, ok, msg = download_ticker(t, data_dir, start, refresh_after_days, end, max_retries)
+        if msg.startswith("skipped"):
+            skipped += 1
+        elif ok:
+            succeeded += 1
+        else:
+            failed.append(ticker)
+            if len(failed) <= 10:   # only print first 10 failures inline
+                print(f"  FAIL [{ticker}]: {msg}")
 
-            if done % 50 == 0 or done == total:
-                print(f"  Progress: {done}/{total}  "
-                      f"(ok={succeeded}, skipped={skipped}, failed={len(failed)})")
+        if done % 50 == 0 or done == total:
+            print(f"  Progress: {done}/{total}  "
+                  f"(ok={succeeded}, skipped={skipped}, failed={len(failed)})")
 
-            time.sleep(delay)
+        time.sleep(delay)
 
     print(f"\nDownload complete:")
     print(f"  Succeeded : {succeeded}")
