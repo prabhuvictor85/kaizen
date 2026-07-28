@@ -87,6 +87,30 @@ def test_unchanged_data_keeps_checkpoint(tmp_path):
         assert ok
 
 
+def test_as_of_invalidates_when_data_is_frozen(tmp_path):
+    """The pre-download case: history fetched ONCE up front, so CSV mtimes
+    never move and the data fingerprint is identical at every walk-forward
+    step. Without as_of in the manifest, step 40 would be handed the panel
+    built for step 3 — the exact staleness bug this guard exists to stop."""
+    d = _data_dir(tmp_path)
+    mf = tmp_path / "ckpt_manifest.json"
+    base = {"pit_universe": True, "train_start": "2010-01-01"}
+
+    write_manifest(mf, compute_manifest(d, cli={**base, "as_of": "2024-03-31"}))
+
+    # Same data, same code, same flags — only the step's as_of moved on.
+    ok, reason = manifest_ok(
+        mf, compute_manifest(d, cli={**base, "as_of": "2024-06-30"}))
+    assert not ok
+    assert "cli changed" in reason
+
+    # And the SAME as_of on frozen data is still a legitimate hit (a resumed
+    # run re-entering the same step must not pay for a needless rebuild).
+    ok, _ = manifest_ok(
+        mf, compute_manifest(d, cli={**base, "as_of": "2024-03-31"}))
+    assert ok
+
+
 @pytest.mark.parametrize("cli_a,cli_b", [
     ({"pit_universe": False, "train_start": "2010-01-01"},
      {"pit_universe": True,  "train_start": "2010-01-01"}),

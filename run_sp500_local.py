@@ -640,7 +640,8 @@ def train(panel: pd.DataFrame, benchmark_close: pd.Series,
     ckpt_manifest = CKPT / "ckpt_manifest.json"
     _mf_now = compute_manifest(
         STOCK_DATA_DIR,
-        cli={"pit_universe": bool(pit_universe), "train_start": train_start},
+        cli={"pit_universe": bool(pit_universe), "train_start": train_start,
+             "as_of": as_of},
     )
     _mf_ok, _mf_reason = manifest_ok(ckpt_manifest, _mf_now)
 
@@ -2491,6 +2492,38 @@ def main() -> None:
             as_of_dt = datetime.strptime(args.as_of, "%Y-%m-%d")
             print(f"\n  [as_of={args.as_of}] Using {args.as_of} as reference date "
                   f"for staleness checks and scoring.")
+
+        # ── Causality guard: nothing after as_of may exist ─────────────────
+        # The CSVs can run PAST as_of — when a walk-forward step is redone out
+        # of order, or when the whole history is downloaded once up front. Two
+        # things leak if those rows survive:
+        #   1. labels: future_{h}d_return at t uses close[t+h], so a row at
+        #      t <= as_of can be labelled from prices AFTER as_of.
+        #   2. feature state: zone/ICT features are latched — whether a zone is
+        #      "still valid" depends on whether price LATER violated it, so bars
+        #      after as_of can retroactively rewrite an earlier row's value.
+        # (2) is why this must run BEFORE feature engineering, not after:
+        # truncating later would leave the contamination baked into the values.
+        # Everything downstream — features, targets, CV folds, scoring — is
+        # derived from this panel and inherits the cutoff.
+        # In a normal forward step the downloader stopped at as_of + 1 day, so
+        # nothing is dropped and this is silent.
+        if as_of_dt is not None:
+            _as_of_ts = pd.Timestamp(as_of_dt)
+            _d = panel.index.get_level_values("date")
+            _before = len(panel)
+            panel = panel[_d <= _as_of_ts].copy()
+            _dropped = _before - len(panel)
+            if _dropped > 0:
+                print(f"  [as_of={args.as_of}] causality guard: dropped "
+                      f"{_dropped:,} post-as_of rows before feature build "
+                      f"(prevents look-ahead in labels and zone/ICT state).")
+            # Defence in depth. The excess-return label already NaNs out past
+            # the cutoff (the stock's own forward return is NaN there, so
+            # future - benchmark is NaN), and rolling beta reindexes onto panel
+            # dates — but scoring never needs the benchmark beyond as_of, so
+            # there is no reason to keep it available.
+            benchmark_close = benchmark_close[benchmark_close.index <= _as_of_ts]
 
         # ── Data freshness checks (StaleDataGuard) ─────────────────────────
         from pipeline.monitoring.stale_data_guard import StaleDataGuard, StaleDataError

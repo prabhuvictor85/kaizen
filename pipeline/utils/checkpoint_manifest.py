@@ -70,8 +70,15 @@ def compute_manifest(data_dir, cli: dict | None = None) -> dict:
     """Fingerprint everything the cached panel was built from.
 
     cli: recipe-affecting command-line settings. The checkpoint is built from
-    the already-trimmed, already-PIT-filtered panel, so --pit_universe and
-    --train_start change its CONTENT even when code and data are identical.
+    the already-trimmed, already-PIT-filtered, already-as_of-truncated panel,
+    so --pit_universe, --train_start and --as_of change its CONTENT even when
+    code and data are identical.
+
+    --as_of matters most when the whole price history is downloaded ONCE up
+    front: CSV mtimes then never move, so the data fingerprint is identical at
+    every walk-forward step and would happily hand step 40 the panel built for
+    step 3. as_of is what distinguishes them.
+
     --mode is deliberately excluded: sharing one panel across momentum and
     reversal is the checkpoint's whole purpose.
     """
