@@ -582,7 +582,9 @@ def train(panel: pd.DataFrame, benchmark_close: pd.Series,
           mode_artefacts_dir: Optional[Path] = None,
           n_jobs: int = 1,
           as_of: Optional[str] = None,
-          train_end: Optional[str] = None) -> dict:
+          train_end: Optional[str] = None,
+          pit_universe: bool = False,
+          train_start: Optional[str] = None) -> dict:
     """Full train: features → targets → CV → Optuna → models → calibration.
 
     mode: "legacy" | "momentum" | "reversal"
@@ -624,7 +626,38 @@ def train(panel: pd.DataFrame, benchmark_close: pd.Series,
     feat_cols_ckpt = CKPT / "feat_cols.txt"
     targets_ckpt   = CKPT / "panel_targets.pkl"
 
-    if targets_ckpt.exists() and feat_cols_ckpt.exists():
+    # ── Checkpoint guard ─────────────────────────────────────────────────
+    # The checkpoint exists to share one panel between the momentum and
+    # reversal passes of a SINGLE invocation. It also persists on disk, so
+    # without this guard the next walk-forward step at a LATER --as_of silently
+    # re-used it: training on features that stopped months earlier and scoring
+    # a stale cross-section. The manifest records what the panel was built from
+    # (feature/target code, price-CSV freshness, recipe flags); any mismatch
+    # rebuilds. It can only force a rebuild you'd have wanted anyway.
+    from pipeline.utils.checkpoint_manifest import (
+        compute_manifest, manifest_ok, write_manifest,
+    )
+    ckpt_manifest = CKPT / "ckpt_manifest.json"
+    _mf_now = compute_manifest(
+        STOCK_DATA_DIR,
+        cli={"pit_universe": bool(pit_universe), "train_start": train_start},
+    )
+    _mf_ok, _mf_reason = manifest_ok(ckpt_manifest, _mf_now)
+
+    if not _mf_ok and (targets_ckpt.exists() or panel_ckpt.exists()):
+        print(f"\n      [ckpt-guard] checkpoint IGNORED — {_mf_reason}")
+        print("      [ckpt-guard] rebuilding features+targets from scratch")
+        # Unlink immediately: leaving a stale pickle on disk while a fresh
+        # manifest gets written later means an interrupt between the two makes
+        # the NEXT run trust the stale panel again.
+        if targets_ckpt.exists():
+            targets_ckpt.unlink()
+        if panel_ckpt.exists():
+            panel_ckpt.unlink()
+        if ckpt_manifest.exists():
+            ckpt_manifest.unlink()
+
+    if _mf_ok and targets_ckpt.exists() and feat_cols_ckpt.exists():
         with _train_perf.stage("[1/6] Feature engineering"):
             print("\n[1/6] Feature engineering ... SKIPPED (targets checkpoint supersedes)")
             feat_cols = feat_cols_ckpt.read_text().strip().split("\n")
@@ -649,7 +682,8 @@ def train(panel: pd.DataFrame, benchmark_close: pd.Series,
                 with open(panel_ckpt, "wb") as f:
                     pickle.dump(panel, f)
                 feat_cols_ckpt.write_text("\n".join(feat_cols))
-                print(f"      Checkpoint saved: {panel_ckpt}")
+                write_manifest(ckpt_manifest, _mf_now)
+                print(f"      Checkpoint saved: {panel_ckpt} (+ manifest)")
 
         with _train_perf.stage("[2/6] Target building"):
             print("[2/6] Building targets ...")
@@ -658,7 +692,8 @@ def train(panel: pd.DataFrame, benchmark_close: pd.Series,
             print(f"      cs_rank_20d non-null: {panel['cs_rank_20d'].notna().sum()} — saving checkpoint ...")
             with open(targets_ckpt, "wb") as f:
                 pickle.dump(panel, f)
-            print(f"      Checkpoint saved: {targets_ckpt}")
+            write_manifest(ckpt_manifest, _mf_now)
+            print(f"      Checkpoint saved: {targets_ckpt} (+ manifest)")
             try:
                 if panel_ckpt.exists():
                     panel_ckpt.unlink()
@@ -2571,6 +2606,8 @@ def main() -> None:
                         n_jobs=args.n_jobs,
                         as_of=args.as_of,
                         train_end=args.train_end,
+                        pit_universe=args.pit_universe,
+                        train_start=args.train_start,
                     )
                 panel = artefacts["panel"]   # feature-engineered panel — required for score_and_rank
                 results_by_mode[m] = {

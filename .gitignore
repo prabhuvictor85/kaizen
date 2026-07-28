@@ -65,7 +65,10 @@ quick_*.py
 smoke_*.py
 profile_*.py
 preview_*.py
-test*.py
+# Root-level scratch only — unanchored `test*.py` silently ignored every NEW
+# file under tests/ (existing ones were tracked before the pattern landed).
+# This already cost one validator once: 2a2afbf "was lost to .gitignore test*.py".
+/test*.py
 main.py
 out*.txt
 err.txt
