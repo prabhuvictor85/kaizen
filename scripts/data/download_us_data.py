@@ -51,9 +51,16 @@ CONSTITUENT_CSV = PATHS.stock_lists.us_combined  # constituents_us_combined.csv
 
 BENCHMARK_TICKERS = ["^GSPC", "^NDX"]   # S&P 500 + NASDAQ 100 indices
 START_DATE        = "2010-01-01"         # history start
-RATE_LIMIT_SLEEP  = 0.5                  # 500ms between tickers (base delay)
+RATE_LIMIT_SLEEP  = 0.5                  # base delay for RETRY backoff (not routine pacing)
 MAX_RETRIES       = 3                    # retries per ticker on rate-limit / transient error
 RETRY_BACKOFF     = 2.0                  # multiply sleep by this factor on each retry
+
+# Routine pacing: one pause every N network calls, instead of a pause after
+# every single ticker. A per-ticker 0.5s delay cost 1602 * 0.5 = 13m21s per
+# walk-forward step — longer than the inference it feeds — while a batched
+# pause costs 32 * 2s = 64s for the same universe.
+BATCH_SLEEP_EVERY = 50                   # pause after this many network calls
+BATCH_SLEEP_SECS  = 2.0                  # seconds to pause
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,8 +75,12 @@ def parse_args() -> argparse.Namespace:
                    help=f"History start date (default: {START_DATE})")
     p.add_argument("--end", default=None,
                    help="History end date e.g. 2023-12-31 (default: today)")
-    p.add_argument("--delay", type=float, default=RATE_LIMIT_SLEEP,
-                   help=f"Seconds to sleep between ticker downloads (default: {RATE_LIMIT_SLEEP}).")
+    p.add_argument("--batch_size", type=int, default=BATCH_SLEEP_EVERY,
+                   help=f"Pause after this many network calls (default: {BATCH_SLEEP_EVERY}).")
+    p.add_argument("--batch_sleep", type=float, default=BATCH_SLEEP_SECS,
+                   help=f"Seconds to pause per batch (default: {BATCH_SLEEP_SECS}). "
+                        f"Total pacing cost per full universe is "
+                        f"(tickers / batch_size) * batch_sleep.")
     p.add_argument("--retries", type=int, default=MAX_RETRIES,
                    help=f"Max retries per ticker on transient failure (default: {MAX_RETRIES}).")
     return p.parse_args()
@@ -219,10 +230,16 @@ def _yf_download_with_retry(ticker: str, max_retries: int, **kwargs) -> pd.DataF
 def download_ticker(ticker: str, data_dir: Path, start: str,
                     refresh_after_days: int,
                     end: str = None,
-                    max_retries: int = MAX_RETRIES) -> tuple[str, bool, str]:
+                    max_retries: int = MAX_RETRIES) -> tuple[str, bool, str, bool]:
     """
     Download daily OHLCV for a single ticker and save as {ticker}-1d.csv.
-    Returns (ticker, success, message).
+    Returns (ticker, success, message, hit_network).
+
+    hit_network is False when the function returned without contacting
+    Yahoo (already up to date / no trading days in the window). The caller
+    uses it to skip the inter-ticker rate-limit sleep: sleeping to be polite
+    to a server we never called is pure dead time, and on an incremental
+    walk-forward step almost every ticker takes one of those paths.
 
     Incremental mode: if the file already exists (and no forced refresh), only
     bars after the last stored date up to `end` are fetched and appended. This
@@ -250,24 +267,24 @@ def download_ticker(ticker: str, data_dir: Path, start: str,
                 new_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
                 # Nothing to fetch if already at/past the requested end date
                 if end and new_start >= end:
-                    return ticker, True, "skipped (up to date)"
+                    return ticker, True, "skipped (up to date)", False
                 # Skip if the window contains no trading days (e.g. as_of is a weekend)
                 if end:
                     bdays = pd.bdate_range(new_start,
                                            pd.Timestamp(end) - pd.Timedelta(days=1))
                     if len(bdays) == 0:
-                        return ticker, True, f"skipped (no trading days {new_start} → {end})"
+                        return ticker, True, f"skipped (no trading days {new_start} → {end})", False
                 df_new = _yf_download_with_retry(
                     ticker, max_retries,
                     start=new_start, end=end,
                     auto_adjust=True, multi_level_index=False,
                 )
                 if df_new.empty:
-                    return ticker, True, f"skipped (no new bars after {last_date.date()})"
+                    return ticker, True, f"skipped (no new bars after {last_date.date()})", True
                 df_new = _normalise_us(df_new)
                 for req in ("Open", "High", "Low", "Close", "Volume"):
                     if req not in df_new.columns:
-                        return ticker, False, f"missing column {req} in new data"
+                        return ticker, False, f"missing column {req} in new data", True
                 df_new = df_new[["Open", "High", "Low", "Close", "Volume"]]
                 df_new = df_new[df_new["Close"].notna() & (df_new["Close"] > 0)]
                 # Merge and deduplicate
@@ -275,11 +292,11 @@ def download_ticker(ticker: str, data_dir: Path, start: str,
                 df = df[~df.index.duplicated(keep="last")].sort_index()
                 df.index.name = "Date"
                 df.to_csv(path)
-                return ticker, True, f"+{len(df_new)} new rows (total {len(df)})"
+                return ticker, True, f"+{len(df_new)} new rows (total {len(df)})", True
 
         # ── Full download (new file or forced refresh) ─────────────────────
         if not file_needs_update(path, refresh_after_days):
-            return ticker, True, "skipped (up to date)"
+            return ticker, True, "skipped (up to date)", False
 
         df = _yf_download_with_retry(
             ticker, max_retries,
@@ -287,37 +304,39 @@ def download_ticker(ticker: str, data_dir: Path, start: str,
             auto_adjust=True, multi_level_index=False,
         )
         if df.empty:
-            return ticker, False, "empty response from yfinance"
+            return ticker, False, "empty response from yfinance", True
 
         df = _normalise_us(df)
 
         for req in ("Open", "High", "Low", "Close", "Volume"):
             if req not in df.columns:
-                return ticker, False, f"missing column {req}"
+                return ticker, False, f"missing column {req}", True
 
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index.name = "Date"
         df = df[df["Close"].notna() & (df["Close"] > 0)]
 
         if len(df) < 50:
-            return ticker, False, f"only {len(df)} rows — likely delisted or new"
+            return ticker, False, f"only {len(df)} rows — likely delisted or new", True
 
         df.to_csv(path)
-        return ticker, True, f"{len(df)} rows saved"
+        return ticker, True, f"{len(df)} rows saved", True
 
     except Exception as e:
-        return ticker, False, str(e)[:80]
+        return ticker, False, str(e)[:80], True
 
 
 def download_all(tickers: List[str], data_dir: Path, start: str,
                  refresh_after_days: int, end: str = None,
-                 delay: float = RATE_LIMIT_SLEEP,
+                 batch_size: int = BATCH_SLEEP_EVERY,
+                 batch_sleep: float = BATCH_SLEEP_SECS,
                  max_retries: int = MAX_RETRIES) -> None:
     """Download all tickers sequentially with progress reporting.
 
     Parameters
     ----------
-    delay       : seconds to sleep between tickers (rate-limit guard)
+    batch_size  : pause after this many NETWORK calls (rate-limit guard)
+    batch_sleep : seconds to pause per batch
     max_retries : per-ticker retries with exponential backoff on empty/error
     """
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -328,7 +347,7 @@ def download_all(tickers: List[str], data_dir: Path, start: str,
     failed: List[str] = []
 
     print(f"\nDownloading {total} tickers to {data_dir} ...")
-    print(f"  delay={delay}s/ticker  retries={max_retries}")
+    print(f"  pacing={batch_sleep}s every {batch_size} network calls  retries={max_retries}")
     print(f"  (existing files {'will be refreshed if older than ' + str(refresh_after_days) + ' days' if refresh_after_days > 0 else 'will be skipped'})\n")
 
     # Plain sequential loop — the safest approach for Yahoo Finance's rate
@@ -337,9 +356,13 @@ def download_all(tickers: List[str], data_dir: Path, start: str,
     # future edit to bump MAX_WORKERS without realizing that was the only
     # thing keeping yfinance's shared cache access single-threaded).
     done = 0
+    no_net = 0
+    net_calls = 0        # real Yahoo requests — drives the batch pause
+    batch_pauses = 0
     for t in tickers:
         done += 1
-        ticker, ok, msg = download_ticker(t, data_dir, start, refresh_after_days, end, max_retries)
+        ticker, ok, msg, hit_network = download_ticker(
+            t, data_dir, start, refresh_after_days, end, max_retries)
         if msg.startswith("skipped"):
             skipped += 1
         elif ok:
@@ -353,7 +376,20 @@ def download_all(tickers: List[str], data_dir: Path, start: str,
             print(f"  Progress: {done}/{total}  "
                   f"(ok={succeeded}, skipped={skipped}, failed={len(failed)})")
 
-        time.sleep(delay)
+        # Pace on NETWORK calls only: one pause per batch_size real requests.
+        # Counting network calls (not loop iterations) means a resumed/cached
+        # run — where tickers return without contacting Yahoo — pays nothing.
+        if hit_network:
+            net_calls += 1
+            if net_calls % batch_size == 0:
+                time.sleep(batch_sleep)
+                batch_pauses += 1
+        else:
+            no_net += 1
+
+    print(f"  Pacing: {net_calls} network calls, {batch_pauses} pauses "
+          f"= {batch_pauses * batch_sleep:.0f}s"
+          + (f"  ({no_net} tickers needed no network call)" if no_net else ""))
 
     print(f"\nDownload complete:")
     print(f"  Succeeded : {succeeded}")
@@ -371,8 +407,8 @@ def download_benchmarks(data_dir: Path, start: str, refresh_after_days: int,
     print(f"\nDownloading benchmark indices ...")
     data_dir.mkdir(parents=True, exist_ok=True)
     for ticker in BENCHMARK_TICKERS:
-        t, ok, msg = download_ticker(ticker, data_dir, start, refresh_after_days, end,
-                                     max_retries=max_retries)
+        t, ok, msg, _hit = download_ticker(ticker, data_dir, start, refresh_after_days, end,
+                                           max_retries=max_retries)
         status = "OK" if ok else "FAILED"
         print(f"  [{status}] {ticker}: {msg}")
 
@@ -400,7 +436,8 @@ def main() -> None:
         tickers = [t.strip().upper() for t in args.tickers]
         print(f"\nDownloading {len(tickers)} specified ticker(s)...")
         download_all(tickers, DATA_DIR, args.start, args.refresh_after, args.end,
-                     delay=args.delay, max_retries=args.retries)
+                     batch_size=args.batch_size, batch_sleep=args.batch_sleep,
+                     max_retries=args.retries)
         download_benchmarks(DATA_DIR, args.start, args.refresh_after, args.end)
         return
 
@@ -420,7 +457,8 @@ def main() -> None:
 
     print(f"\n[2/2] Downloading {len(tickers)} stock files...")
     download_all(tickers, DATA_DIR, args.start, args.refresh_after, args.end,
-                 delay=args.delay, max_retries=args.retries)
+                 batch_size=args.batch_size, batch_sleep=args.batch_sleep,
+                 max_retries=args.retries)
 
     print(f"\nDownloading benchmark indices...")
     download_benchmarks(DATA_DIR, args.start, max(1, args.refresh_after), args.end)
