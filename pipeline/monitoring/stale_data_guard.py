@@ -124,6 +124,70 @@ class StaleDataGuard:
 
     # ── Individual checks ─────────────────────────────────────────────────────
 
+    def check_future_bars(
+        self, panel: pd.DataFrame, tolerance_days: int = 7
+    ) -> List[StaleIssue]:
+        """Flag tickers whose last bar runs far AHEAD of the rest of the universe.
+
+        The mirror of _check_last_bar_staleness: that one catches data which is
+        too OLD, this one catches a ticker that has run away into the future.
+        Such a ticker is worse than a stale one for two reasons:
+
+        1. It is invisible. Every other check passes and the run proceeds.
+        2. It is self-perpetuating. The incremental downloader computes
+           new_start = last_bar + 1 day; when that exceeds the requested --end
+           it reports "skipped (up to date)" and returns, so the ticker can
+           never be corrected by any later download.
+
+        It then waits until the walk's as_of passes the rest of the universe's
+        last bar, at which point it ALONE defines the newest panel date — and
+        the scored cross-section collapses to that single ticker.
+        (Observed: AMTM carried 2026-07 data for ~45 steps, then starved the
+        2025-06-30 cross-section to 1/1556 tickers, surfacing as an
+        unrelated-looking LightGBM "must be 2 dimensional and non empty".)
+
+        Deliberately measured against the universe's own median last bar, NOT
+        against as_of. Comparing to as_of looks equivalent but breaks the moment
+        the price history is downloaded once up front: then EVERY ticker is
+        legitimately ahead of every step's as_of, the check fires on all of
+        them, and a permanently-firing alarm is one nobody reads. Data ahead of
+        as_of is normal and the causality guard handles it; a ticker ahead of
+        its PEERS is the actual defect, and that signal is scale-free — it
+        holds whether the universe sits in 2024 or 2026.
+
+        Call on the RAW panel, before the causality guard truncates it.
+
+        Error severity, so --strict_data_check can halt on it; otherwise it is
+        a loud, named warning pointing straight at the offending files.
+        """
+        dates   = panel.index.get_level_values("date")
+        tickers = panel.index.get_level_values("ticker")
+        last_bar = pd.Series(dates, index=tickers).groupby(level=0).max()
+        if len(last_bar) < 2:
+            return []   # no peer group to be an outlier against
+
+        universe_last = last_bar.median()
+        cutoff = universe_last + pd.Timedelta(days=tolerance_days)
+        ahead = last_bar[last_bar > cutoff]
+        if ahead.empty:
+            return []
+
+        newest = ahead.max()
+        return [StaleIssue(
+            severity="error",
+            check="FutureBars",
+            message=(
+                f"{len(ahead)} ticker(s) run ahead of the universe: newest bar "
+                f"{newest.date()} vs universe median {universe_last.date()} "
+                f"({(newest - universe_last).days} days ahead). These cannot "
+                f"self-correct — the incremental downloader reports them as "
+                f"'up to date' forever, and once as_of passes the rest of the "
+                f"universe they alone define the newest cross-section. Delete "
+                f"the CSV(s) so the next download rebuilds them within --end."
+            ),
+            tickers=ahead.index.tolist()[:20],
+        )]
+
     def _check_last_bar_staleness(
         self, panel: pd.DataFrame, as_of: datetime
     ) -> List[StaleIssue]:

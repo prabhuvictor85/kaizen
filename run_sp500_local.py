@@ -2510,6 +2510,13 @@ def main() -> None:
         # nothing is dropped and this is silent.
         if as_of_dt is not None:
             _as_of_ts = pd.Timestamp(as_of_dt)
+            # Report future-dated tickers BEFORE truncating — afterwards there
+            # is by construction nothing left to find. Truncation makes the run
+            # correct; this says WHICH files are wrong, because they cannot fix
+            # themselves (see StaleDataGuard.check_future_bars).
+            from pipeline.monitoring.stale_data_guard import StaleDataGuard as _SDG
+            for _iss in _SDG().check_future_bars(panel):
+                print(f"  {_iss}")
             _d = panel.index.get_level_values("date")
             _before = len(panel)
             panel = panel[_d <= _as_of_ts].copy()
