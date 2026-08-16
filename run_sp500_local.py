@@ -2428,7 +2428,9 @@ def main() -> None:
             for _sym, _idx in zip(ticker_df["Symbol"].str.strip(),
                                    ticker_df["Indices"].fillna("")):
                 _idx_s = str(_idx).strip()
-                if "SPX" in _idx_s or "NDX" in _idx_s:
+                # LRG = large cap in no US index (foreign ADRs: TSM, BABA, NVO).
+                # Market-cap derived, so it needs an explicit token.
+                if "SPX" in _idx_s or "NDX" in _idx_s or _idx_s == "LRG":
                     cap_tier_map[str(_sym).strip()] = "large"
                 elif _idx_s == "MID":
                     cap_tier_map[str(_sym).strip()] = "mid"

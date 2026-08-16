@@ -131,7 +131,7 @@ def build_cap_tier_map(cfg: dict) -> dict[str, str]:
         for _, row in df.iterrows():
             sym = str(row["Symbol"]).strip()
             idx = str(row.get("Indices", "")).strip()
-            if "SPX" in idx or "NDX" in idx:
+            if "SPX" in idx or "NDX" in idx or idx == "LRG":
                 tier_map[sym] = "large"
             elif idx == "MID":
                 tier_map[sym] = "mid"

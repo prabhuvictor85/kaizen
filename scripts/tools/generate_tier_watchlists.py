@@ -33,6 +33,7 @@ TIER_MAP_INDEX = {
     "SPX":     "large",
     "NDX":     "large",
     "NDX|SPX": "large",
+    "LRG":     "large",   # large cap in no US index (foreign ADRs: TSM, BABA)
     "MID":     "mid",
     "SML":     "small",
 }
