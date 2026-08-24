@@ -87,10 +87,27 @@ class PortfolioConstructor:
         cs = cross_section.copy()
         cs["_score"] = scores.reindex(cs.index).fillna(-999)
 
+        # ── Gate audit ─────────────────────────────────────────────────────
+        # Stages 4 and 5 of the decision path are decided in here and were
+        # previously discarded. Downstream grading cannot otherwise tell
+        # "the sector was full" from "the seats ran out" — the two have
+        # different fixes. Recorded on the instance so the return signature,
+        # which other callers depend on, is unchanged.
+        self.last_audit: List[Dict] = []
+        _tk = lambda ix: ix[1] if isinstance(ix, tuple) else ix
+
         # ── Liquidity filter ───────────────────────────────────────────────
         if "adv_20d_usd" in cs.columns:
             before = len(cs)
-            cs = cs[cs["adv_20d_usd"] >= cfg.min_adv_usd]
+            _survivors = cs["adv_20d_usd"] >= cfg.min_adv_usd
+            for ix, ok in zip(cs.index, _survivors):
+                if not ok:
+                    self.last_audit.append({
+                        "ticker": _tk(ix), "pass_liquidity": False,
+                        "rank_post_filter": None, "sector_at_cap": None,
+                        "selected": False, "outcome": "liquidity",
+                    })
+            cs = cs[_survivors]
             removed = before - len(cs)
             if removed > 0:
                 log.warning(f"Portfolio: removed {removed} tickers below min_adv_usd={cfg.min_adv_usd}")
@@ -108,16 +125,31 @@ class PortfolioConstructor:
 
         selected_tickers: List[str] = []
         sector_counts: Dict[str, int] = {}
+        # seats gone — keep iterating only to record the rest.
+        # Pre-set when top_n <= 0 so a zero-seat portfolio still selects
+        # nothing, matching the original break-before-select ordering.
+        _full = self.top_n <= 0
 
-        for idx_row in cs.itertuples():
-            if len(selected_tickers) >= self.top_n:
-                break
-            ticker = idx_row.Index[1] if isinstance(idx_row.Index, tuple) else idx_row.Index
+        for _pos, idx_row in enumerate(cs.itertuples(), start=1):
+            ticker = _tk(idx_row.Index)
             sec = getattr(idx_row, sector_col, "Unknown")
-            if sector_counts.get(sec, 0) >= max_per_sector:
-                continue
-            selected_tickers.append(ticker)
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
+            if _full:
+                outcome, capped, chosen = "seats_exhausted", False, False
+            elif sector_counts.get(sec, 0) >= max_per_sector:
+                outcome, capped, chosen = "sector_at_cap", True, False
+            else:
+                selected_tickers.append(ticker)
+                sector_counts[sec] = sector_counts.get(sec, 0) + 1
+                outcome, capped, chosen = "selected", False, True
+                if len(selected_tickers) >= self.top_n:
+                    _full = True
+
+            self.last_audit.append({
+                "ticker": ticker, "pass_liquidity": True,
+                "rank_post_filter": _pos, "sector": sec,
+                "sector_at_cap": capped, "selected": chosen, "outcome": outcome,
+            })
 
         if not selected_tickers:
             return {}, {}

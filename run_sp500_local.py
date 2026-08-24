@@ -1446,6 +1446,55 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
     pc_bull = PortfolioConstructor(cfg, top_n=top_n, weighting=weighting)
     bull_ticker_scores, bull_weights = pc_bull.construct(cross_wl_bull, bull_score_wl)
 
+    # ── Gate audit: why every scored ticker did or did not make the list ───
+    # The five filter stages each know their own answer and then discard it,
+    # so downstream grading cannot tell "the gate vetoed it" from "the sector
+    # was full" from "the seats ran out". Those have different fixes.
+    # Emitted per (date, mode); bull side only, matching v1 scope.
+    try:
+        _tk_of = lambda ix: ix[1] if isinstance(ix, tuple) else ix
+        _all = [_tk_of(ix) for ix in cross.index]
+        _blend = pd.Series(bull_final, index=_all)
+
+        _pass_mode = pd.Series(_wl_mask.values, index=_all)
+        _pass_zone = pd.Series(False, index=_all)
+        _pass_zone.loc[[_tk_of(i) for i in cross_wl.index]] = _bull_comp_wl.values > _MIN_COMPOSITE
+        _pass_gate = pd.Series(False, index=_all)
+        _pass_gate.loc[[_tk_of(i) for i in cross_wl.index]] = _bull_zone_mask.values
+
+        _pc = {r["ticker"]: r for r in getattr(pc_bull, "last_audit", [])}
+
+        def _outcome(t: str) -> str:
+            if not _pass_mode.get(t, False):      return "mode_universe"
+            if not _pass_zone.get(t, False):      return "zone_presence"
+            if not _pass_gate.get(t, False):      return "quality_gate"
+            return _pc.get(t, {}).get("outcome", "not_reached_constructor")
+
+        _audit = pd.DataFrame({
+            "as_of_date":       latest_date.strftime("%Y-%m-%d"),
+            "mode":             mode,
+            "ticker":           _all,
+            "blend_score":      _blend.values,
+            "rank_pre_filter":  _blend.rank(ascending=False, method="min").astype(int).values,
+            "pass_mode_universe": [bool(_pass_mode.get(t, False)) for t in _all],
+            "pass_zone_presence": [bool(_pass_zone.get(t, False)) for t in _all],
+            "pass_quality_gate":  [bool(_pass_gate.get(t, False)) for t in _all],
+            "pass_liquidity":   [_pc.get(t, {}).get("pass_liquidity") for t in _all],
+            "sector_at_cap":    [_pc.get(t, {}).get("sector_at_cap")  for t in _all],
+            "rank_post_filter": [_pc.get(t, {}).get("rank_post_filter") for t in _all],
+            "selected":         [bool(_pc.get(t, {}).get("selected", False)) for t in _all],
+            "removal_rule":     [_outcome(t) for t in _all],
+        }).sort_values("rank_pre_filter")
+
+        _ga = OUTPUT_DIR / f"gate_audit_{mode}_{latest_date.strftime('%Y-%m-%d')}.csv"
+        _audit.to_csv(_ga, index=False)
+        print(f"  [{mode}] gate audit: {len(_audit)} rows -> {_ga.name}  "
+              f"({int(_audit.selected.sum())} selected, "
+              f"{int((_audit.removal_rule == 'sector_at_cap').sum())} sector-capped, "
+              f"{int((_audit.removal_rule == 'seats_exhausted').sum())} seats-exhausted)")
+    except Exception as _e:      # never let the audit break a pipeline run
+        print(f"  [{mode}] WARNING: gate audit not written — {type(_e).__name__}: {_e}")
+
     # ── BEAR portfolio: top_n highest bear scores ─────────────────────────
     cross_wl_bear["group_date"] = latest_date
     pc_bear = PortfolioConstructor(cfg, top_n=top_n, weighting=weighting)
