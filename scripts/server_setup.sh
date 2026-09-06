@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-# server_setup.sh — One-shot Hetzner server bootstrap for ml-stock-predictor
+# server_setup.sh — One-shot Hetzner server bootstrap for kaizen
 #
 # Run this once after every new server creation:
 #   bash server_setup.sh
 #
 # What it does:
 #   1. Mounts the persistent Hetzner Volume (/dev/sdb → /mnt/data)
-#   2. Creates required directory structure on the volume
-#   3. Clones / updates ml-stock-predictor from GitHub (master branch)
-#   4. Installs Python dependencies
-#   5. Writes paths.yaml pointing to /mnt/data
+#   2. Creates a 50 GB swap file (resizes an existing smaller one)
+#   3. Creates the directory structure on the volume
+#   4. Installs system packages (pip, venv, libgomp1, lz4)
+#   5. Clones / updates the base ml-stock-predictor checkout
+#   6. Adds the kaizen remote and checks it out as a worktree at ~/kaizen-run
+#   7. Installs Python dependencies into system Python
+#   8. Puts paths.yaml in place
+#   9. Persists the runtime environment (FEATURE_BUILD_WORKERS, nofile)
 #
 # Prerequisites:
 #   - Volume "ml-data" already exists on Hetzner and is attached to this server
-#   - GitHub repo is accessible (public or SSH key pre-loaded)
+#   - GitHub repos are accessible (public or SSH key pre-loaded)
 #   - Python 3.10+ already installed (Hetzner Ubuntu images include it)
+#
+# NOTE ON PYTHON: this script installs into SYSTEM python3 with
+# --break-system-packages, not into a venv. Nothing to activate — run
+# `python3 ...` directly. (Earlier versions built /root/venv; if one is left
+# over from a previous run it is now unused and can be deleted.)
 # =============================================================================
 
 set -euo pipefail
@@ -28,7 +37,7 @@ set -euo pipefail
 #
 # GitHub token: required for private repos. Get from:
 #   https://github.com/settings/tokens  (repo scope)
-# Leave blank if repo is public.
+# Leave blank if repos are public.
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
 # HF token: required for uploading/downloading from HF Hub. Get from:
@@ -38,19 +47,34 @@ HF_TOKEN="${HF_TOKEN:-}"
 
 # ── Config — edit these if they change ──────────────────────────────────────
 GITHUB_USER="prabhuvictor85"
-GITHUB_REPO_NAME="ml-stock-predictor"
+GITHUB_REPO_NAME="ml-stock-predictor"     # base checkout (predecessor repo)
 GIT_BRANCH="master"
 PROJECT_DIR="/root/ml-stock-predictor"
+
+KAIZEN_REPO_NAME="kaizen"                 # the model repo that actually runs
+KAIZEN_REMOTE="kaizen"
+KAIZEN_BRANCH="main"
+KAIZEN_DIR="/root/kaizen-run"             # git worktree of kaizen/main
+
 VOLUME_DEVICE="/dev/sdb"
 MOUNT_POINT="/mnt/data"
 
-# Build clone URL — uses token if set, plain HTTPS otherwise
+SWAP_SIZE_GB=50                           # OOM buffer for large folds
+
+FEATURE_BUILD_WORKERS_DEFAULT=4
+NOFILE_LIMIT=65536
+
+# Build clone URLs — use token if set, plain HTTPS otherwise
 if [ -n "${GITHUB_TOKEN}" ]; then
     GITHUB_REPO="https://${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${GITHUB_REPO_NAME}.git"
     GITHUB_REPO_DISPLAY="https://***@github.com/${GITHUB_USER}/${GITHUB_REPO_NAME}.git"
+    KAIZEN_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${KAIZEN_REPO_NAME}.git"
+    KAIZEN_URL_DISPLAY="https://***@github.com/${GITHUB_USER}/${KAIZEN_REPO_NAME}.git"
 else
     GITHUB_REPO="https://github.com/${GITHUB_USER}/${GITHUB_REPO_NAME}.git"
     GITHUB_REPO_DISPLAY="${GITHUB_REPO}"
+    KAIZEN_URL="https://github.com/${GITHUB_USER}/${KAIZEN_REPO_NAME}.git"
+    KAIZEN_URL_DISPLAY="${KAIZEN_URL}"
 fi
 
 # Paths on the volume (survive server deletion)
@@ -68,9 +92,9 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 section() { echo -e "\n${GREEN}===== $* =====${NC}"; }
 
 # =============================================================================
-# 1. MOUNT VOLUME
+# 1/9  MOUNT VOLUME
 # =============================================================================
-section "1/6  Mounting Hetzner Volume"
+section "1/9  Mounting Hetzner Volume"
 
 if mountpoint -q "${MOUNT_POINT}"; then
     info "Volume already mounted at ${MOUNT_POINT} — skipping"
@@ -116,37 +140,64 @@ else
 fi
 
 # =============================================================================
-# 1b. SWAP FILE  (prevents OOM kills on large folds — 8 GB overflow buffer)
+# 2/9  SWAP FILE  (50 GB overflow buffer — prevents OOM kills on large folds)
 # =============================================================================
-section "1b/6  Configuring swap"
+section "2/9  Configuring ${SWAP_SIZE_GB}GB swap"
 
 SWAPFILE="/swapfile"
-SWAP_SIZE="8G"
+SWAP_BYTES=$(( SWAP_SIZE_GB * 1024 * 1024 * 1024 ))
 
-if swapon --show | grep -q "${SWAPFILE}"; then
-    info "Swap already active at ${SWAPFILE} — skipping"
-elif [ -f "${SWAPFILE}" ]; then
-    info "Swap file exists but not active — enabling ..."
-    swapon "${SWAPFILE}"
-    info "Swap enabled: $(free -h | grep Swap)"
-else
-    info "Creating ${SWAP_SIZE} swap file at ${SWAPFILE} ..."
-    fallocate -l "${SWAP_SIZE}" "${SWAPFILE}"
+# Current size of the existing swapfile, 0 if absent.
+CURRENT_SWAP_BYTES=0
+if [ -f "${SWAPFILE}" ]; then
+    CURRENT_SWAP_BYTES=$(stat -c %s "${SWAPFILE}" 2>/dev/null || echo 0)
+fi
+
+make_swap() {
+    # Free space on / must cover the new file. If a smaller swapfile is being
+    # replaced its bytes come back to us, so count them as available.
+    local avail_bytes
+    avail_bytes=$(( $(df --output=avail -B1 / | tail -1) + CURRENT_SWAP_BYTES ))
+    if [ "${avail_bytes}" -lt "$(( SWAP_BYTES + 5 * 1024 * 1024 * 1024 ))" ]; then
+        echo -e "${RED}[ERROR]${NC} Not enough free space on / for a ${SWAP_SIZE_GB}GB swap file."
+        echo "  → Need ${SWAP_SIZE_GB}GB + 5GB headroom; have $(( avail_bytes / 1024 / 1024 / 1024 ))GB."
+        echo "  → Lower SWAP_SIZE_GB at the top of this script, or resize the server disk."
+        exit 1
+    fi
+    swapoff "${SWAPFILE}" 2>/dev/null || true
+    rm -f "${SWAPFILE}"
+    info "Creating ${SWAP_SIZE_GB}GB swap file at ${SWAPFILE} (this takes a moment) ..."
+    fallocate -l "${SWAP_BYTES}" "${SWAPFILE}" \
+        || dd if=/dev/zero of="${SWAPFILE}" bs=1M count=$(( SWAP_SIZE_GB * 1024 )) status=progress
     chmod 600 "${SWAPFILE}"
     mkswap "${SWAPFILE}"
     swapon "${SWAPFILE}"
-    # Persist across reboots
     if ! grep -q "${SWAPFILE}" /etc/fstab; then
         echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
         info "Added swap to /etc/fstab (auto-enabled on reboot)"
     fi
-    info "Swap ready: $(free -h | grep Swap)"
+    info "Swap ready: $(free -h | grep -i swap)"
+}
+
+if [ "${CURRENT_SWAP_BYTES}" -eq "${SWAP_BYTES}" ]; then
+    if swapon --show | grep -q "${SWAPFILE}"; then
+        info "${SWAP_SIZE_GB}GB swap already active — skipping"
+    else
+        info "${SWAP_SIZE_GB}GB swap file exists but is not active — enabling ..."
+        swapon "${SWAPFILE}"
+        info "Swap enabled: $(free -h | grep -i swap)"
+    fi
+elif [ "${CURRENT_SWAP_BYTES}" -gt 0 ]; then
+    warn "Existing swap is $(( CURRENT_SWAP_BYTES / 1024 / 1024 / 1024 ))GB — resizing to ${SWAP_SIZE_GB}GB"
+    make_swap
+else
+    make_swap
 fi
 
 # =============================================================================
-# 2. CREATE DIRECTORY STRUCTURE ON VOLUME
+# 3/9  CREATE DIRECTORY STRUCTURE ON VOLUME
 # =============================================================================
-section "2/6  Creating directory structure on volume"
+section "3/9  Creating directory structure on volume"
 
 mkdir -p "${NSE_DATA_DIR}"
 mkdir -p "${US_DATA_DIR}"
@@ -159,12 +210,33 @@ info "  ${STOCK_LISTS_DIR}"
 info "  ${ARTEFACTS_ROOT}"
 
 # =============================================================================
-# 3. CLONE / UPDATE GITHUB REPO
+# 4/9  SYSTEM PACKAGES
 # =============================================================================
-section "3/6  Cloning / updating repository"
+section "4/9  Installing system packages"
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y python3-pip python3-venv
+
+# libgomp1: LightGBM's OpenMP runtime. Marked manual so an autoremove during a
+# later apt run cannot take it out from under lightgbm.
+apt-get install -y libgomp1
+apt-mark manual libgomp1
+
+# lz4: fast panel checkpoint compression. Distro package first, pip after —
+# the pip wheel is what Python actually imports if both are present.
+apt-get install -y python3-lz4 || warn "python3-lz4 unavailable from apt — pip wheel will cover it"
+
+info "System packages installed"
+
+# =============================================================================
+# 5/9  BASE REPO — clone / update ml-stock-predictor
+# =============================================================================
+section "5/9  Cloning / updating base repository"
 
 if [ -d "${PROJECT_DIR}/.git" ]; then
-    info "Repo already exists — pulling latest ${GIT_BRANCH} ..."
+    info "Base repo already exists — pulling latest ${GIT_BRANCH} ..."
     git -C "${PROJECT_DIR}" fetch origin
     git -C "${PROJECT_DIR}" checkout "${GIT_BRANCH}"
     git -C "${PROJECT_DIR}" pull origin "${GIT_BRANCH}"
@@ -173,72 +245,91 @@ else
     git clone --branch "${GIT_BRANCH}" "${GITHUB_REPO}" "${PROJECT_DIR}"
 fi
 
-info "Repo ready at ${PROJECT_DIR}"
+info "Base repo ready at ${PROJECT_DIR}"
 
-# Re-exec from the repo's copy of this script so we always run the latest version.
-# Guard against infinite loop with SETUP_REEXECED env var.
-REPO_SCRIPT="${PROJECT_DIR}/scripts/server_setup.sh"
-if [ -z "${SETUP_REEXECED:-}" ] && [ -f "${REPO_SCRIPT}" ]; then
-    if ! diff -q "$0" "${REPO_SCRIPT}" &>/dev/null; then
-        info "Newer version of setup script found — re-executing from repo ..."
-        export SETUP_REEXECED=1
-        exec bash "${REPO_SCRIPT}" "$@"
-    fi
-fi
+# NOTE: the old "re-exec from the repo's copy of this script" block was removed
+# here on purpose. Two repos are now in play, and it re-executed the *base*
+# repo's copy — silently reverting to the pre-kaizen setup. Pull the script you
+# want and run that one.
 
 # =============================================================================
-# 4. INSTALL PYTHON DEPENDENCIES  (isolated venv — avoids all system-pip issues)
+# 6/9  KAIZEN — remote + worktree at ${KAIZEN_DIR}
 # =============================================================================
-section "4/6  Installing Python dependencies"
+section "6/9  Setting up the kaizen worktree"
 
-cd "${PROJECT_DIR}"
-
-VENV_DIR="/root/venv"
-
-# Ensure python3-venv is available
-if ! python3 -m venv --help &>/dev/null; then
-    info "python3-venv not found — installing ..."
-    apt-get update -qq && apt-get install -y python3-venv python3-full
-fi
-
-# Create venv if it doesn't exist yet
-if [ ! -f "${VENV_DIR}/bin/activate" ]; then
-    info "Creating virtual environment at ${VENV_DIR} ..."
-    python3 -m venv "${VENV_DIR}"
+# Remote (idempotent — set-url if it already exists, so a rotated token lands)
+if git -C "${PROJECT_DIR}" remote get-url "${KAIZEN_REMOTE}" &>/dev/null; then
+    git -C "${PROJECT_DIR}" remote set-url "${KAIZEN_REMOTE}" "${KAIZEN_URL}"
+    info "Remote '${KAIZEN_REMOTE}' already present — URL refreshed"
 else
-    info "Virtual environment already exists at ${VENV_DIR} — reusing"
+    git -C "${PROJECT_DIR}" remote add "${KAIZEN_REMOTE}" "${KAIZEN_URL}"
+    info "Added remote '${KAIZEN_REMOTE}' → ${KAIZEN_URL_DISPLAY}"
 fi
 
-# Activate venv and install requirements
-source "${VENV_DIR}/bin/activate"
+git -C "${PROJECT_DIR}" fetch "${KAIZEN_REMOTE}"
 
-if [ -f "requirements.txt" ]; then
-    info "Installing from requirements.txt into venv ..."
-    pip install --upgrade pip --quiet
-    pip install -r requirements.txt --quiet
+# Worktree (idempotent — reuse and fast-forward if it is already there)
+if [ -e "${KAIZEN_DIR}/.git" ]; then
+    info "Worktree already exists at ${KAIZEN_DIR} — updating to ${KAIZEN_REMOTE}/${KAIZEN_BRANCH} ..."
+    git -C "${KAIZEN_DIR}" fetch "${KAIZEN_REMOTE}" "${KAIZEN_BRANCH}"
+    git -C "${KAIZEN_DIR}" checkout --detach "${KAIZEN_REMOTE}/${KAIZEN_BRANCH}"
 else
-    warn "requirements.txt not found — skipping pip install"
+    info "Adding worktree ${KAIZEN_DIR} at ${KAIZEN_REMOTE}/${KAIZEN_BRANCH} ..."
+    git -C "${PROJECT_DIR}" worktree add "${KAIZEN_DIR}" "${KAIZEN_REMOTE}/${KAIZEN_BRANCH}"
 fi
 
-info "Python dependencies installed into ${VENV_DIR}"
+info "kaizen ready at ${KAIZEN_DIR} — $(git -C "${KAIZEN_DIR}" rev-parse --short HEAD) (detached)"
 
 # =============================================================================
-# 5. WRITE paths.yaml  (only if it does not already exist)
+# 7/9  PYTHON DEPENDENCIES  (system python3, --break-system-packages)
 # =============================================================================
-section "5/6  Writing paths.yaml"
+section "7/9  Installing Python dependencies"
 
-PATHS_YAML="${PROJECT_DIR}/paths.yaml"
+cd "${KAIZEN_DIR}"
 
-if [ -f "${PATHS_YAML}" ]; then
-    info "paths.yaml already exists — skipping (delete it manually to regenerate)"
-    cat "${PATHS_YAML}"
+PIP_FLAGS="--break-system-packages"
+
+# requirements-lock.txt is the validated set; requirements.txt alone re-resolves
+# and can drift. Prefer the lock when it is present.
+if [ -f "${KAIZEN_DIR}/requirements-lock.txt" ]; then
+    info "Installing from requirements-lock.txt ..."
+    python3 -m pip install ${PIP_FLAGS} -r "${KAIZEN_DIR}/requirements-lock.txt"
+elif [ -f "${KAIZEN_DIR}/requirements.txt" ]; then
+    info "Installing from requirements.txt ..."
+    python3 -m pip install ${PIP_FLAGS} -r "${KAIZEN_DIR}/requirements.txt"
 else
+    warn "No requirements file found in ${KAIZEN_DIR} — skipping pip install"
+fi
+
+python3 -m pip install ${PIP_FLAGS} lz4
+
+# Verify the one import that silently breaks without libgomp1.
+if python3 -c "import lightgbm; print(lightgbm.__version__)"; then
+    info "LightGBM imports cleanly"
+else
+    echo -e "${RED}[ERROR]${NC} LightGBM failed to import — libgomp1 or the wheel is broken."
+    exit 1
+fi
+
+# =============================================================================
+# 8/9  paths.yaml
+# =============================================================================
+section "8/9  Putting paths.yaml in place"
+
+PATHS_YAML="${KAIZEN_DIR}/paths.yaml"
+VOLUME_PATHS_YAML="${MOUNT_POINT}/paths.yaml"
+
+if [ -f "${VOLUME_PATHS_YAML}" ]; then
+    cp "${VOLUME_PATHS_YAML}" "${PATHS_YAML}"
+    info "Copied ${VOLUME_PATHS_YAML} → ${PATHS_YAML}"
+else
+    warn "${VOLUME_PATHS_YAML} not found — generating a default from this script's paths"
     cat > "${PATHS_YAML}" <<EOF
 # paths.yaml — auto-generated by server_setup.sh
-# All data lives on the persistent Hetzner Volume at /mnt/data.
+# All data lives on the persistent Hetzner Volume at ${MOUNT_POINT}.
 
 data_root:    ${DATA_ROOT}
-project_root: ${PROJECT_DIR}
+project_root: ${KAIZEN_DIR}
 
 stock_lists:
   nse_local:     ${STOCK_LISTS_DIR}/constituentsi.csv
@@ -255,15 +346,44 @@ stock_data:
 
 artefacts_root: ${ARTEFACTS_ROOT}
 EOF
-    info "paths.yaml written to ${PATHS_YAML}"
-    cat "${PATHS_YAML}"
+    info "Default paths.yaml written — keep a copy at ${VOLUME_PATHS_YAML} so it survives the server"
 fi
+cat "${PATHS_YAML}"
 
 # =============================================================================
-# 6. HF LOGIN  (only if HF_TOKEN is set)
+# 9/9  RUNTIME ENVIRONMENT + HF LOGIN
 # =============================================================================
-section "6/6  Hugging Face login"
+section "9/9  Persisting runtime environment"
 
+# `export` and `ulimit` inside this script die with it. Write them to
+# profile.d + limits.d so every later login shell — and the pipeline run that
+# matters — actually gets them.
+PROFILE_D="/etc/profile.d/kaizen.sh"
+cat > "${PROFILE_D}" <<EOF
+# Written by server_setup.sh — kaizen runtime environment
+export FEATURE_BUILD_WORKERS=${FEATURE_BUILD_WORKERS_DEFAULT}
+ulimit -n ${NOFILE_LIMIT} 2>/dev/null || true
+EOF
+chmod 644 "${PROFILE_D}"
+info "Wrote ${PROFILE_D} (FEATURE_BUILD_WORKERS=${FEATURE_BUILD_WORKERS_DEFAULT}, nofile=${NOFILE_LIMIT})"
+
+# profile.d only covers login shells. limits.d covers everything else.
+LIMITS_D="/etc/security/limits.d/99-kaizen.conf"
+cat > "${LIMITS_D}" <<EOF
+# Written by server_setup.sh — raise open-file limit for feature builds
+root soft nofile ${NOFILE_LIMIT}
+root hard nofile ${NOFILE_LIMIT}
+*    soft nofile ${NOFILE_LIMIT}
+*    hard nofile ${NOFILE_LIMIT}
+EOF
+chmod 644 "${LIMITS_D}"
+info "Wrote ${LIMITS_D}"
+
+# Apply to this shell too, so anything below sees them.
+export FEATURE_BUILD_WORKERS="${FEATURE_BUILD_WORKERS_DEFAULT}"
+ulimit -n "${NOFILE_LIMIT}" 2>/dev/null || warn "Could not raise nofile in this shell — takes effect on next login"
+
+# ── HF login (only if HF_TOKEN is set) ───────────────────────────────────────
 if [ -n "${HF_TOKEN}" ]; then
     if command -v hf &>/dev/null; then
         echo "${HF_TOKEN}" | hf auth login --token-stdin 2>/dev/null \
@@ -292,20 +412,23 @@ echo -e "${GREEN}  Server setup complete!${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo "  Volume  : ${MOUNT_POINT}  (persists after server deletion)"
-echo "  Project : ${PROJECT_DIR}"
+echo "  Base    : ${PROJECT_DIR}"
+echo "  kaizen  : ${KAIZEN_DIR}   ← run from here"
 echo "  Data    : ${DATA_ROOT}"
 echo "  Models  : ${ARTEFACTS_ROOT}"
+echo "  Swap    : $(free -h | grep -i swap | awk '{print $2}')"
 echo ""
 echo "Next steps:"
-echo "  # Activate the Python venv first (required every new shell session):"
-echo "  source /root/venv/bin/activate"
+echo "  # Pick up FEATURE_BUILD_WORKERS and the raised nofile limit:"
+echo "  exec bash -l          # or just log out and back in"
 echo ""
-echo "  # Download NSE data (first time or delta update):"
-echo "  cd ${PROJECT_DIR}"
-echo "  python scripts/data/download_nse_data.py"
+echo "  # Download US data (first time or delta update):"
+echo "  cd ${KAIZEN_DIR}"
+echo "  python3 scripts/data/download_us_data.py"
 echo ""
-echo "  # Run full training:"
-echo "  python run_nse_local.py"
+echo "  # Run the pipeline:"
+echo "  cd ${KAIZEN_DIR}"
+echo "  python3 run_sp500_local.py"
 echo ""
 echo "  # When done — detach volume in Hetzner console, then delete server."
 echo ""
