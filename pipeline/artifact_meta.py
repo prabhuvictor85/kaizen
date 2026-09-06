@@ -34,6 +34,26 @@ def _git_commit() -> Optional[str]:
         return None
 
 
+def _git_dirty() -> Optional[bool]:
+    """True if the working tree had uncommitted changes at write time.
+
+    None means "could not tell" — not "clean". A False here is a positive
+    claim that git_commit describes the code that actually ran, so it must
+    never be produced by a failed git call.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+            cwd=Path(__file__).resolve().parent,
+        )
+        if out.returncode != 0:
+            return None
+        return bool(out.stdout.strip())
+    except Exception:
+        return None
+
+
 def _lib_versions() -> dict:
     versions = {}
     for lib in ("lightgbm", "pandas", "numpy", "sklearn"):
@@ -70,9 +90,11 @@ def write_artifact_meta(
             "schema_version":  ARTIFACT_SCHEMA_VERSION,
             "created_utc":     datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "git_commit":      _git_commit(),
+            "git_dirty":       _git_dirty(),
             "mode":            mode,
             "nan_native":      nan_native,
             "feature_count":   len(final_features),
+            "selected_features": list(final_features),
             "feature_hash":    hashlib.sha256(feature_blob.encode()).hexdigest()[:16],
             "train_data": {
                 "date_min":    str(dates.min().date()),
