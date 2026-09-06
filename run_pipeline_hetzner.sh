@@ -163,12 +163,13 @@ clean_regenerable() {
     # Delete large regenerable caches under the artefacts root. Safe between
     # steps — panel checkpoints + fold caches are recomputed on the next run.
     log "  Cleaning regenerable caches to free disk ..."
+    # feat_cols.txt is deliberately NOT in this list. It is ~3 KB and it is the
+    # only record of the panel's feature roster at build time — deleting it
+    # frees nothing and destroys provenance.
     rm -f  "${ARTEFACTS_ROOT}"/nse_local/checkpoints/panel_features.pkl \
            "${ARTEFACTS_ROOT}"/nse_local/checkpoints/panel_targets.pkl  \
-           "${ARTEFACTS_ROOT}"/nse_local/checkpoints/feat_cols.txt      \
            "${ARTEFACTS_ROOT}"/us_local/checkpoints/panel_features.pkl  \
-           "${ARTEFACTS_ROOT}"/us_local/checkpoints/panel_targets.pkl   \
-           "${ARTEFACTS_ROOT}"/us_local/checkpoints/feat_cols.txt 2>/dev/null || true
+           "${ARTEFACTS_ROOT}"/us_local/checkpoints/panel_targets.pkl 2>/dev/null || true
     rm -rf "${ARTEFACTS_ROOT}"/nse_local/*/fold_cache \
            "${ARTEFACTS_ROOT}"/us_local/*/fold_cache 2>/dev/null || true
 }
@@ -253,11 +254,11 @@ notify "✅ NSE done (${NSE_HM})" \
 log ""
 log "STEP 2 — Cleaning NSE panel checkpoints to free disk"
 
+# feat_cols.txt is kept on purpose — see clean_regenerable() above.
 FREED=0
 for CKPT_FILE in \
     "${NSE_CKPT}/panel_features.pkl" \
-    "${NSE_CKPT}/panel_targets.pkl"  \
-    "${NSE_CKPT}/feat_cols.txt"
+    "${NSE_CKPT}/panel_targets.pkl"
 do
     if [ -f "${CKPT_FILE}" ]; then
         SIZE_BYTES=$(du -sb "${CKPT_FILE}" 2>/dev/null | cut -f1)
@@ -311,6 +312,23 @@ run_with_oom_retry "${SP500_LOG}" \
 
 SP500_ELAPSED=$(( $(date +%s) - SP500_START ))
 SP500_HM=$(printf "%dh %02dm" $(( SP500_ELAPSED / 3600 )) $(( (SP500_ELAPSED % 3600) / 60 )))
+
+# ── STEP 4: Archive provenance ────────────────────────────────────────────────
+# ~5 KB per run. These three files are what makes a scored watchlist traceable
+# back to the feature roster and the code that produced it. They are otherwise
+# overwritten by the next run.
+
+log ""
+log "STEP 4 — Archiving provenance"
+
+PROV_DATE=$(date +%F)
+PROV_DIR="${ARTEFACTS_ROOT}/us_local/provenance/${PROV_DATE}"
+mkdir -p "${PROV_DIR}"
+cp "${ARTEFACTS_ROOT}/us_local/checkpoints/feat_cols.txt"        \
+   "${ARTEFACTS_ROOT}/us_local/momentum/selected_features.txt"   \
+   "${ARTEFACTS_ROOT}/us_local/momentum/artefact_meta.json"      \
+   "${PROV_DIR}/" 2>/dev/null || true
+log "  Archived $(ls -1 "${PROV_DIR}" 2>/dev/null | wc -l)/3 files -> ${PROV_DIR}"
 
 TOTAL_HM=$(elapsed_hm)
 
