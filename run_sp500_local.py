@@ -1294,6 +1294,55 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
     model_scores = ensemble.score(X_inf, vol_series)
     model_series = pd.Series(model_scores, index=cross.index)
 
+    # ── Scored feature matrix: what the model actually saw ────────────────
+    # Without this, reconstructing why a stock ranked where it did means
+    # re-running today's feature code against history and hoping it still
+    # produces what it produced then. The watchlist carries 10 hand-picked
+    # columns for picks only; this is every column fed to the model, for every
+    # scored ticker.
+    #
+    # The sidecar records `dropped` — features the model was trained on that
+    # were ABSENT from the panel. Line 1283 selects the intersection silently,
+    # so a feature that vanished upstream is scored as if it never existed and
+    # nothing says so. `dropped` is that gap, written down.
+    try:
+        _fdate = latest_date.strftime("%Y-%m-%d")
+        _fx = X_inf.copy()
+        _fx.index = [ix[1] if isinstance(ix, tuple) else ix for ix in _fx.index]
+        _fx.index.name = "ticker"
+        _fx_path = OUTPUT_DIR / f"features_scored_{mode}_{_fdate}.parquet"
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        _fx.to_parquet(_fx_path)
+
+        _dropped = [f for f in final_features if f not in cross.columns]
+        _roster = {
+            "as_of_date":      _fdate,
+            "requested_as_of": as_of_date.strftime("%Y-%m-%d") if as_of_date is not None else None,
+            "mode":            mode,
+            "variant":         variant,
+            "n_tickers":       int(len(_fx)),
+            "n_final_features": len(final_features),
+            "n_scored":        len(avail),
+            "n_dropped":       len(_dropped),
+            "final_features":  list(final_features),
+            "scored_features": list(avail),
+            "dropped_features": _dropped,
+        }
+        import json as _json
+        _roster_path = OUTPUT_DIR / f"features_scored_{mode}_{_fdate}.roster.json"
+        with open(_roster_path, "w") as _rf:
+            _json.dump(_roster, _rf, indent=2)
+
+        print(f"  [{mode}] scored features: {len(_fx)} tickers x {len(avail)} "
+              f"features -> {_fx_path.name}")
+        if _dropped:
+            print(f"  [{mode}] *** {len(_dropped)} TRAINED FEATURES MISSING from the "
+                  f"panel — scored without them: {_dropped[:5]}"
+                  + (" ..." if len(_dropped) > 5 else ""))
+    except Exception as _e:   # never let provenance break a pipeline run
+        print(f"  [{mode}] WARNING: scored features not written — "
+              f"{type(_e).__name__}: {_e}")
+
     # ── Sector ETF zone signal ─────────────────────────────────────────────
     # Adds features_sector_etf_bull_score / features_sector_etf_bear_score
     # to cross so signal_weights.yaml can reference them via sector_etf_bull_score
@@ -1429,9 +1478,14 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
     # ── Momentum-bull quality gate (NKE / CPRT false-positive filter) ──────
     # Shared implementation: pipeline/gating.py (this script is the canonical
     # source it was extracted from). No-op for non-momentum modes.
-    from pipeline.gating import momentum_bull_quality_gate
+    from pipeline.gating import (
+        momentum_bull_quality_gate, momentum_bull_quality_gate_detail, VETO_COLUMNS,
+    )
+    # Computed once and reused for both the mask and the audit, so what the
+    # audit reports is by construction what the gate applied.
+    _gate_detail = momentum_bull_quality_gate_detail(cross_wl, mode, FEATURE_PREFIX)
     _bull_zone_mask = _bull_zone_mask & momentum_bull_quality_gate(
-        cross_wl, mode, FEATURE_PREFIX)
+        cross_wl, mode, FEATURE_PREFIX, detail=_gate_detail)
 
     cross_wl_bull = cross_wl[_bull_zone_mask.values]
     cross_wl_bear = cross_wl[_bear_zone_mask.values]
@@ -1464,6 +1518,18 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
 
         _pc = {r["ticker"]: r for r in getattr(pc_bull, "last_audit", [])}
 
+        # Per-prong veto detail. "quality_gate" names four independent prongs
+        # with four different fixes, so record which one fired. Reindexed onto
+        # the full cross-section: tickers that never reached the gate (mode
+        # universe or zone presence removed them) are <NA>, as is any prong
+        # whose feature columns were missing — neither is a passing check.
+        _gd = _gate_detail.copy()
+        _gd.index = [_tk_of(i) for i in _gate_detail.index]
+        _prongs = {
+            col: _gd[col].reindex(_all).astype("boolean").values
+            for col in VETO_COLUMNS
+        }
+
         def _outcome(t: str) -> str:
             if not _pass_mode.get(t, False):      return "mode_universe"
             if not _pass_zone.get(t, False):      return "zone_presence"
@@ -1484,6 +1550,7 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
             "rank_post_filter": [_pc.get(t, {}).get("rank_post_filter") for t in _all],
             "selected":         [bool(_pc.get(t, {}).get("selected", False)) for t in _all],
             "removal_rule":     [_outcome(t) for t in _all],
+            **_prongs,
         }).sort_values("rank_pre_filter")
 
         _ga = OUTPUT_DIR / f"gate_audit_{mode}_{latest_date.strftime('%Y-%m-%d')}.csv"
