@@ -56,15 +56,28 @@ def _ob_then_violation_path() -> pd.DataFrame:
 def test_htf_resample_rules_are_right_labelled():
     """
     Monthly/quarterly/yearly resample rules must be period-END anchored. A
-    period-START rule (MS/QS/YS) labels the bar on the left edge, so merge_asof
-    backward attaches a still-incomplete (future) period to early daily bars —
-    a look-ahead leak.
+    period-START rule (MonthBegin/QuarterBegin/YearBegin) labels the bar on the
+    left edge, so merge_asof backward attaches a still-incomplete (future)
+    period to early daily bars — a look-ahead leak.
     """
-    assert _ICT_HTF_RESAMPLE["1mo"] == "ME"
-    assert _ICT_HTF_RESAMPLE["3mo"] == "QE"
-    assert _ICT_HTF_RESAMPLE["1y"] == "YE"
+    assert isinstance(_ICT_HTF_RESAMPLE["1mo"], pd.offsets.MonthEnd)
+    assert isinstance(_ICT_HTF_RESAMPLE["3mo"], pd.offsets.QuarterEnd)
+    assert isinstance(_ICT_HTF_RESAMPLE["1y"], pd.offsets.YearEnd)
     # Weekly is right-anchored on Friday already — safe.
-    assert _ICT_HTF_RESAMPLE["1wk"] == "W-FRI"
+    assert _ICT_HTF_RESAMPLE["1wk"] == pd.offsets.Week(weekday=4)
+
+
+def test_htf_resample_rules_are_not_string_aliases():
+    """F-C12: string aliases are version-fragile — pandas 2.2 renamed M/Q/Y to
+    ME/QE/YE and <2.2 raises ValueError on the new spellings. That error is
+    swallowed by the per-timeframe except in engineer.py, so a mismatch drops
+    every 1mo/3mo/1y ICT column while the run still reports success. Offset
+    objects were never renamed. Nothing here may go back to being a string.
+    """
+    for tf, rule in _ICT_HTF_RESAMPLE.items():
+        assert not isinstance(rule, str), (
+            f"{tf} is the string {rule!r} — use a pd.offsets object instead"
+        )
 
 
 def test_no_lookahead_in_monthly_merge_asof():

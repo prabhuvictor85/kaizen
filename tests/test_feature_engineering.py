@@ -369,6 +369,52 @@ def test_ict_zone_priority_in_valid_range(built_panel):
     assert vals.max() <= 3.0 + 1e-6, f"ict_bull_zone_priority above 3: {vals.max()}"
 
 
+def test_htf_ict_columns_are_actually_built(built_panel):
+    """F-C12 end-to-end guard: the multi-timeframe ICT columns must EXIST.
+
+    They were absent for every ticker on pandas < 2.2, because the resample rule
+    was the string "ME" — which that pandas rejects — and the per-timeframe
+    except in engineer.py logged the ValueError at debug level and continued.
+    A run looked completely healthy while three of four timeframes were missing.
+
+    Only 1wk and 1mo are asserted: the fixture spans 300 business days, so 3mo
+    is borderline and 1y legitimately hits the `len(htf) < 5` skip.
+    """
+    from pipeline.features.engineer import _ICT_CARRY_COLS
+
+    missing = [
+        f"{FEATURE_PREFIX}{col}_{tf}"
+        for tf in ("1wk", "1mo")
+        for col in _ICT_CARRY_COLS
+        if f"{FEATURE_PREFIX}{col}_{tf}" not in built_panel.columns
+    ]
+    assert not missing, (
+        f"{len(missing)} HTF ICT columns were never built — the resample rule "
+        f"is being rejected and swallowed. Missing: {missing[:5]}"
+    )
+
+
+def test_htf_score_can_reach_the_gate_threshold(built_panel):
+    """F-C12 consequence guard: ict_bear_htf_score feeds a live veto.
+
+    The score sums timeframe contributions weighted 1+2+3+4+5 and divides by 15.
+    With 1mo/3mo/1y silently dropped only 1d+1wk survive, capping the score at
+    3/15 = 0.20 — below ICT_BEAR_VETO_THRESHOLD (0.4), so the gate prong could
+    never fire. The columns existing is not enough; the arithmetic must be able
+    to clear the threshold it is compared against.
+    """
+    from pipeline.features.engineer import _ICT_HTF_W, _ICT_SIGNAL_MAX
+    from pipeline.gating import ICT_BEAR_VETO_THRESHOLD
+
+    reachable = sum(_ICT_HTF_W.values()) / _ICT_SIGNAL_MAX
+    assert reachable > ICT_BEAR_VETO_THRESHOLD, (
+        f"max attainable ict_bear_htf_score is {reachable:.2f}, at or below the "
+        f"{ICT_BEAR_VETO_THRESHOLD} veto threshold — the prong cannot fire"
+    )
+    for side in ("bull", "bear"):
+        assert f"{FEATURE_PREFIX}ict_{side}_htf_score" in built_panel.columns
+
+
 # ── 5. Fold recompute ─────────────────────────────────────────────────────────
 
 def test_recompute_fold_features_produces_ict_columns():

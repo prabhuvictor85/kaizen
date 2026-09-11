@@ -313,7 +313,7 @@ def main() -> None:
         panel = build_time_honest_zones(
             panel=panel,
             analyze_zones_fn=zone_analyzer.analyze_zones,
-            checkpoint_freq="YE",
+            checkpoint_freq=pd.offsets.YearEnd(),
             timeframes=["1d", "1wk", "1mo", "3mo", "1y"],
         )
         log.info("Zone labeling complete.")

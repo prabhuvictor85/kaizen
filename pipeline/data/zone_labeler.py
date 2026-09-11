@@ -47,8 +47,18 @@ from pipeline.utils.logging import get_logger
 log = get_logger(__name__)
 
 # Default checkpoint frequency: yearly (last calendar date of each year).
-# Can be changed to "QS" (quarterly) for more granular, "MS" for monthly.
-DEFAULT_CHECKPOINT_FREQ = "YE"    # pandas offset alias for year-end
+#
+# A DateOffset OBJECT, never a string alias. pandas 2.2 renamed the period-end
+# aliases M/Q/Y -> ME/QE/YE, and <2.2 raises ValueError on the new spellings.
+# The string "YE" therefore broke _build_checkpoints on older pandas, and
+# train.py's handler falls back to the existing (NOT time-honest) zone columns
+# whenever this fails — so the leak-free relabeling was skipped with only a
+# warning. The offset classes were never renamed and need no version guard.
+#
+# Period-START frequencies are still passed as strings if you want them
+# (pd.offsets.QuarterBegin() / MonthBegin(), or the "QS"/"MS" aliases, which
+# pandas did not rename).
+DEFAULT_CHECKPOINT_FREQ = pd.offsets.YearEnd()
 
 # Minimum number of trading rows required per ticker to attempt zone analysis.
 MIN_ROWS_FOR_ANALYSIS = 60
@@ -65,9 +75,11 @@ class ExpandingWindowZoneLabeler:
         Must accept a DataFrame with columns: open, high, low, close, volume, Date
         and return a DataFrame with a 'Zone' column and optionally zone-type columns.
 
-    checkpoint_freq  : str
-        Pandas offset alias that controls how often zones are recomputed.
-        Default "YE" = year-end.  Use "QS" for quarterly.
+    checkpoint_freq  : pd.DateOffset | str
+        How often zones are recomputed. Default pd.offsets.YearEnd().
+        Prefer an offset object — pd.offsets.QuarterEnd(), MonthEnd(),
+        QuarterBegin() — over a string alias, whose spelling pandas has
+        renamed before (M/Q/Y → ME/QE/YE in 2.2). Strings still work.
 
     timeframes       : list[str]
         The HTF timeframe suffixes to label.  Determines which columns are written.
@@ -83,7 +95,7 @@ class ExpandingWindowZoneLabeler:
     def __init__(
         self,
         analyze_zones_fn: Callable[[pd.DataFrame], pd.DataFrame],
-        checkpoint_freq: str = DEFAULT_CHECKPOINT_FREQ,
+        checkpoint_freq: pd.DateOffset | str = DEFAULT_CHECKPOINT_FREQ,
         timeframes: Optional[List[str]] = None,
         min_rows: int = MIN_ROWS_FOR_ANALYSIS,
     ) -> None:
@@ -386,7 +398,7 @@ class ExpandingWindowZoneLabeler:
 def build_time_honest_zones(
     panel: pd.DataFrame,
     analyze_zones_fn: Callable[[pd.DataFrame], pd.DataFrame],
-    checkpoint_freq: str = "YE",
+    checkpoint_freq: pd.DateOffset | str = DEFAULT_CHECKPOINT_FREQ,
     timeframes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
@@ -396,7 +408,9 @@ def build_time_honest_zones(
     ----------
     panel            : MultiIndex (date, ticker) panel.
     analyze_zones_fn : market-vision's analyze_zones (or your wrapper).
-    checkpoint_freq  : how often zones are recomputed ('YE', 'QS', 'MS').
+    checkpoint_freq  : how often zones are recomputed. Default
+                       pd.offsets.YearEnd(); pass an offset object rather than
+                       a string alias (see ExpandingWindowZoneLabeler).
     timeframes       : list of TF suffixes, default ["1d","1wk","1mo","3mo","1y"].
 
     Returns

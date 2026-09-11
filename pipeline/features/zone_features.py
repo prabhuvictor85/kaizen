@@ -28,28 +28,24 @@ from pipeline.utils.logging import get_logger
 log = get_logger(__name__)
 _analyzer = ZoneAnalyzer()
 
-# Period-END resample aliases.  pandas 2.2 renamed M/Q/Y → ME/QE/YE and emits a
-# FutureWarning for the old spellings; pandas < 2.2 ONLY accepts the old ones and
-# raises ValueError on the new ones.  Pick the spelling the installed pandas
-# accepts so the resample never silently fails (the broad except below would
-# otherwise blank every HTF zone column on a version mismatch).
-_PD_22_PLUS  = tuple(int(x) for x in pd.__version__.split(".")[:2]) >= (2, 2)
-_MONTH_END   = "ME" if _PD_22_PLUS else "M"
-_QUARTER_END = "QE" if _PD_22_PLUS else "Q"
-_YEAR_END    = "YE" if _PD_22_PLUS else "Y"
-
+# Resample rules are DateOffset OBJECTS, never string aliases. pandas 2.2
+# renamed the period-end strings M/Q/Y → ME/QE/YE, and <2.2 raises ValueError on
+# the new spellings — a mismatch the broad except below would turn into silently
+# blank HTF zone columns. The offset classes were never renamed, so they are
+# correct on every pandas version and replace the version guard this file used
+# to carry. Verified identical output to the legacy M/Q/Y/W-FRI aliases.
 _HTF_RESAMPLE = {
     "1d":  None,
-    "1wk": "W-FRI",
-    # Period-END anchored (right-labelled). A period-START rule (MS/QS/YS) labels
-    # the bar on its first day, so the cutoff filter `index <= cutoff_date` lets a
-    # still-incomplete period (whose aggregate includes data PAST the cutoff) into
-    # the training window — defeating the cutoff guard. ME/QE/YE (M/Q/Y on
-    # pandas < 2.2) label on the last day, so an incomplete current period is
-    # correctly excluded until it closes.
-    "1mo": _MONTH_END,
-    "3mo": _QUARTER_END,
-    "1y":  _YEAR_END,
+    "1wk": pd.offsets.Week(weekday=4),   # Friday — equivalent to "W-FRI"
+    # Period-END anchored (right-labelled). A period-START offset (MonthBegin,
+    # QuarterBegin, YearBegin) labels the bar on its first day, so the cutoff
+    # filter `index <= cutoff_date` lets a still-incomplete period (whose
+    # aggregate includes data PAST the cutoff) into the training window —
+    # defeating the cutoff guard. MonthEnd/QuarterEnd/YearEnd label on the last
+    # day, so an incomplete current period is correctly excluded until it closes.
+    "1mo": pd.offsets.MonthEnd(),
+    "3mo": pd.offsets.QuarterEnd(),
+    "1y":  pd.offsets.YearEnd(),
 }
 _MIN_BARS = {"1d": 30, "1wk": 10, "1mo": 6, "3mo": 4, "1y": 2}
 

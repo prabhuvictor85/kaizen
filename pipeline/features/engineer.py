@@ -27,7 +27,19 @@ log = get_logger(__name__)
 FEATURE_PREFIX = "features_"
 
 # ── Multi-timeframe ICT constants ─────────────────────────────────────────────
-_ICT_HTF_RESAMPLE = {"1wk": "W-FRI", "1mo": "ME", "3mo": "QE", "1y": "YE"}
+# Resample rules are DateOffset OBJECTS, never string aliases. pandas renamed
+# the period-end strings M/Q/Y -> ME/QE/YE in 2.2, and <2.2 raises ValueError on
+# the new spellings. That error lands in the per-timeframe `except` below, which
+# logs at debug level and continues — so a version mismatch silently drops every
+# 1mo/3mo/1y ICT column while the run reports success. The offset classes were
+# never renamed, so they are correct on every pandas and need no version guard.
+# Verified identical output to the legacy M/Q/Y/W-FRI aliases.
+_ICT_HTF_RESAMPLE = {
+    "1wk": pd.offsets.Week(weekday=4),   # Friday — equivalent to "W-FRI"
+    "1mo": pd.offsets.MonthEnd(),
+    "3mo": pd.offsets.QuarterEnd(),
+    "1y":  pd.offsets.YearEnd(),
+}
 
 # Zone expiry in bars per timeframe — stale zones deactivate after this many bars.
 # daily=63 (~3mo), weekly=26 (~6mo), monthly=12 (1yr), quarterly=8 (2yr), yearly=3 (3yr)

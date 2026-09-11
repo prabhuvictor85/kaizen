@@ -12,11 +12,22 @@ from pipeline.features.zone_features import _HTF_RESAMPLE
 
 
 def test_zone_htf_resample_is_period_end_anchored():
-    assert _HTF_RESAMPLE["1mo"] == "ME"
-    assert _HTF_RESAMPLE["3mo"] == "QE"
-    assert _HTF_RESAMPLE["1y"] == "YE"
-    assert _HTF_RESAMPLE["1wk"] == "W-FRI"
+    assert isinstance(_HTF_RESAMPLE["1mo"], pd.offsets.MonthEnd)
+    assert isinstance(_HTF_RESAMPLE["3mo"], pd.offsets.QuarterEnd)
+    assert isinstance(_HTF_RESAMPLE["1y"], pd.offsets.YearEnd)
+    assert _HTF_RESAMPLE["1wk"] == pd.offsets.Week(weekday=4)
     assert _HTF_RESAMPLE["1d"] is None
+
+
+def test_zone_htf_resample_rules_are_not_string_aliases():
+    """F-C12: see tests/test_ict_features.py. String aliases are version-fragile
+    and the broad except in compute_zone_features turns a mismatch into blank
+    columns rather than an error. Offset objects have no such exposure.
+    """
+    for tf, rule in _HTF_RESAMPLE.items():
+        assert not isinstance(rule, str), (
+            f"{tf} is the string {rule!r} — use a pd.offsets object instead"
+        )
 
 
 def test_cutoff_guard_excludes_incomplete_period():
