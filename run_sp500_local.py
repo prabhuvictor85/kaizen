@@ -1238,7 +1238,8 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
                    benchmark_close: pd.Series, cfg, top_n: int, weighting: str,
                    as_of_date: Optional[pd.Timestamp] = None,
                    mode: str = "legacy",
-                   variant: str = "composite") -> dict:
+                   variant: str = "composite",
+                   artefact_dir: Optional[Path] = None) -> dict:
     """Score the latest cross-section and build bull + bear portfolios.
 
     mode controls which stocks are eligible for the watchlist:
@@ -1250,6 +1251,7 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
     from pipeline.portfolio.constructor import PortfolioConstructor
     from pipeline.explainability.shap_explainer import SHAPExplainer
     from pipeline.features.engineer import FEATURE_PREFIX
+    from pipeline.models.ensemble import EnsembleConfig
 
     # Pin to the max date present in the CSVs (as_of_date), falling back to
     # the max date in the panel if not provided.
@@ -1308,6 +1310,13 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
     try:
         _fdate = latest_date.strftime("%Y-%m-%d")
         _fx = X_inf.copy()
+        # ensemble.score(X, hist_vol_20d) takes TWO inputs. The tilt is the
+        # second one and carries EnsembleConfig.VOL_WEIGHT of the blend, but it
+        # is read from `cross` rather than from `avail`, so it is not
+        # necessarily a selected feature and would otherwise go unrecorded.
+        # Anything in this parquet that is not in `scored_features` is the tilt.
+        if vol_col is not None and vol_col not in _fx.columns:
+            _fx[vol_col] = vol_series
         _fx.index = [ix[1] if isinstance(ix, tuple) else ix for ix in _fx.index]
         _fx.index.name = "ticker"
         _fx_path = OUTPUT_DIR / f"features_scored_{mode}_{_fdate}.parquet"
@@ -1315,6 +1324,29 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
         _fx.to_parquet(_fx_path)
 
         _dropped = [f for f in final_features if f not in cross.columns]
+
+        # ── Which model produced these scores ─────────────────────────────
+        # Under --skip_train the ensemble is loaded from a previous run and can
+        # be of any vintage. artefact_meta.json sits next to ensemble.pkl and
+        # says which commit built it; nothing used to carry that into the
+        # output, so a watchlist could not be tied to the code that scored it.
+        import hashlib as _hashlib
+        import json as _json
+        _meta: dict = {}
+        if artefact_dir is not None:
+            _mp = Path(artefact_dir) / "artefact_meta.json"
+            if _mp.exists():
+                try:
+                    _meta = _json.loads(_mp.read_text())
+                except Exception as _me:
+                    print(f"  [{mode}] WARNING: artefact_meta.json unreadable ({_me})")
+
+        # The roster we are scoring with, hashed the same way write_artifact_meta
+        # hashes the one the model was trained on. A mismatch means
+        # selected_features.txt and the pickle disagree about the feature set.
+        _live_hash = _hashlib.sha256("\n".join(final_features).encode()).hexdigest()[:16]
+        _trained_hash = _meta.get("feature_hash")
+
         _roster = {
             "as_of_date":      _fdate,
             "requested_as_of": as_of_date.strftime("%Y-%m-%d") if as_of_date is not None else None,
@@ -1327,8 +1359,24 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
             "final_features":  list(final_features),
             "scored_features": list(avail),
             "dropped_features": _dropped,
+            # Second model input — absent means ensemble.score substituted a
+            # uniform 0.5 tilt for every ticker, which is invisible downstream.
+            "vol_tilt_feature": vol_col,
+            "vol_tilt_present": vol_col is not None,
+            "model": {
+                "artefact_dir":     str(artefact_dir) if artefact_dir is not None else None,
+                "meta_found":       bool(_meta),
+                "git_commit":       _meta.get("git_commit"),
+                "git_dirty":        _meta.get("git_dirty"),
+                "created_utc":      _meta.get("created_utc"),
+                "schema_version":   _meta.get("schema_version"),
+                "nan_native":       _meta.get("nan_native"),
+                "trained_feature_hash": _trained_hash,
+                "scored_feature_hash":  _live_hash,
+                "feature_hash_match":   (None if _trained_hash is None
+                                         else _trained_hash == _live_hash),
+            },
         }
-        import json as _json
         _roster_path = OUTPUT_DIR / f"features_scored_{mode}_{_fdate}.roster.json"
         with open(_roster_path, "w") as _rf:
             _json.dump(_roster, _rf, indent=2)
@@ -1339,6 +1387,21 @@ def score_and_rank(panel: pd.DataFrame, ensemble, final_features: List[str],
             print(f"  [{mode}] *** {len(_dropped)} TRAINED FEATURES MISSING from the "
                   f"panel — scored without them: {_dropped[:5]}"
                   + (" ..." if len(_dropped) > 5 else ""))
+        if vol_col is None:
+            print(f"  [{mode}] *** NO {FEATURE_PREFIX}hist_vol_20d — the inverse-vol "
+                  f"tilt is inert (uniform 0.5 for every ticker), and it is "
+                  f"{EnsembleConfig.VOL_WEIGHT:.0%} of the blend.")
+        if not _meta:
+            print(f"  [{mode}] *** NO artefact_meta.json in {artefact_dir} — these "
+                  f"scores cannot be tied to the commit that built the model.")
+        else:
+            print(f"  [{mode}] model: {_meta.get('git_commit')}"
+                  + ("  (DIRTY TREE)" if _meta.get("git_dirty") else "")
+                  + f"  trained {_meta.get('created_utc')}")
+            if _roster["model"]["feature_hash_match"] is False:
+                print(f"  [{mode}] *** FEATURE ROSTER MISMATCH: model was trained on "
+                      f"{_trained_hash}, scoring with {_live_hash}. "
+                      f"selected_features.txt and ensemble.pkl disagree.")
     except Exception as _e:   # never let provenance break a pipeline run
         print(f"  [{mode}] WARNING: scored features not written — "
               f"{type(_e).__name__}: {_e}")
@@ -2825,6 +2888,7 @@ def main() -> None:
                         as_of_date=csv_max_date,
                         mode=m,
                         variant=variant,
+                        artefact_dir=MODE_DIRS[m],
                     )
                 with perf.stage(f"Save outputs — {m} ({variant})"):
                     save_outputs(result, panel, benchmark_close, cfg, mode=m,

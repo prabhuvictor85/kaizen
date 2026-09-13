@@ -13,6 +13,7 @@ all pinned below.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pandas as pd
@@ -58,6 +59,21 @@ def test_roster_survives_a_pandas_index(tmp_path, tiny_panel):
     meta = _read_meta(tmp_path, tiny_panel, features=pd.Index(FEATURES))
     assert meta["selected_features"] == FEATURES
     assert all(isinstance(f, str) for f in meta["selected_features"])
+
+
+def test_feature_hash_recipe_is_reproducible_by_the_scorer(tmp_path, tiny_panel):
+    """Cross-file contract with run_sp500_local.py.
+
+    Scoring re-hashes the roster it is about to use and compares it to this
+    file's feature_hash, warning loudly when they differ — that is how a
+    selected_features.txt / ensemble.pkl disagreement gets caught. If the two
+    hashing recipes ever drift apart the alarm fires on every clean run and
+    stops meaning anything, so pin the recipe here: sha256 of the
+    newline-joined roster, first 16 hex chars.
+    """
+    meta = _read_meta(tmp_path, tiny_panel)
+    scorer_side = hashlib.sha256("\n".join(FEATURES).encode()).hexdigest()[:16]
+    assert meta["feature_hash"] == scorer_side
 
 
 def test_feature_hash_tracks_the_roster(tmp_path, tiny_panel):
